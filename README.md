@@ -1,5 +1,5 @@
 # twinkle
-A minimal Gemini Protocol server for microcontrollers. Written in micropython, tested on Raspberry Pico W.
+A minimal Gemini Protocol server for microcontrollers. Written in micropython 1.2.6, tested on Raspberry Pico W.
 
 Takes care of basic TLS handshakes and exposes the contents of the /public directory using a non-blocking socket. That's it.
 
