@@ -4,6 +4,7 @@ import network
 import time
 import os
 import select
+import gc
 
 from wifisetup import *
 
@@ -16,6 +17,9 @@ HOST = "0.0.0.0"
 PORT = 1965
 CACHE_ENABLED = True
 CACHE_MAX_SIZE = 50
+
+READ_BUFFER_SIZE = 512
+FILE_BUFFER_SIZE = 1024
 
 file_cache = {}
 
@@ -71,19 +75,16 @@ def get_file_content(filepath):
     except OSError:
         return None
 
-    # Check cache
     if CACHE_ENABLED and filepath in file_cache:
         cached_content, cached_mtime = file_cache[filepath]
         if cached_mtime == mtime:
-            return cached_content  # cache still valid
+            return cached_content
 
-    # Read file from disk
     try:
         with open(filepath, "rb") as f:
             content = f.read()
         if CACHE_ENABLED:
             if len(file_cache) >= CACHE_MAX_SIZE:
-                # Simple eviction: remove oldest cached item
                 file_cache.pop(next(iter(file_cache)))
             file_cache[filepath] = (content, mtime)
         return content
@@ -97,25 +98,40 @@ def safe_join(base, *paths):
         return None
     return full
 
-# --- Read Gemini request safely ---
+# --- Read Gemini request safely with reusable buffer ---
+read_buffer = bytearray(READ_BUFFER_SIZE)
+
 def read_request(tls_client, maxlen=1024):
-    buf = b""
+    buf = bytearray()
     while b"\r\n" not in buf and len(buf) < maxlen:
         try:
-            chunk = tls_client.read(1)
-            if not chunk:
+            n = tls_client.readinto(read_buffer)
+            if not n:
                 break
-            buf += chunk
+            buf.extend(read_buffer[:n])
         except OSError:
             break
     return buf.decode().strip()
 
+# --- Send file with reusable buffer ---
+file_buffer = bytearray(FILE_BUFFER_SIZE)
+
+def send_file(tls_client, filepath):
+    try:
+        with open(filepath, "rb") as f:
+            while True:
+                n = f.readinto(file_buffer)
+                if not n:
+                    break
+                tls_client.write(file_buffer[:n])
+    except OSError:
+        pass
+
 # --- Gemini server ---
 def run_gemini_server(cert_path=CERT_PATH, key_path=KEY_PATH):
-    with open(cert_path, "rb") as f:
-        cert_bytes = f.read()
-    with open(key_path, "rb") as f:
-        key_bytes = f.read()
+    # --- Load SSL context once ---
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, keyfile=key_path)
 
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -128,16 +144,21 @@ def run_gemini_server(cert_path=CERT_PATH, key_path=KEY_PATH):
     client_addrs = {}
 
     while True:
+        gc.collect()  # free memory regularly
+	#print(gc.mem_free())
+
+        # Accept new clients
         try:
             client, addr = server.accept()
             print("New connection from", addr)
             client.setblocking(False)
-            tls_client = ssl.wrap_socket(client, server_side=True, key=key_bytes, cert=cert_bytes)
+            tls_client = context.wrap_socket(client, server_side=True)
             clients[client] = tls_client
             client_addrs[client] = addr[0]
         except OSError:
             pass
 
+        # Handle existing clients
         for client, tls_client in list(clients.items()):
             try:
                 r, _, _ = select.select([tls_client], [], [], 0)
@@ -199,7 +220,7 @@ def run_gemini_server(cert_path=CERT_PATH, key_path=KEY_PATH):
                             if content:
                                 mime_type = get_mime_type(filepath)
                                 tls_client.write(f"20 {mime_type}\r\n".encode())
-                                tls_client.write(content)
+                                send_file(tls_client, filepath)
                                 status = f"20 {mime_type}"
                             else:
                                 tls_client.write(b"51 Not Found\r\n")
@@ -210,6 +231,8 @@ def run_gemini_server(cert_path=CERT_PATH, key_path=KEY_PATH):
                             status = "51 Not Found"
 
                     log_request(client_ip, request, status)
+
+                    # Close client promptly
                     tls_client.close()
                     client.close()
                     del clients[client]
