@@ -1,11 +1,11 @@
+import uasyncio as asyncio
 import socket
 import ssl
 import network
 import time
 import os
-import select
 import gc
-
+import machine
 from wifisetup import *
 
 # --- Settings ---
@@ -22,6 +22,44 @@ READ_BUFFER_SIZE = 512
 FILE_BUFFER_SIZE = 1024
 
 file_cache = {}
+
+# --- Monitoring ---
+start_time = time.ticks_ms()
+total_clients = 0
+max_clients_per_sec = 0
+clients_this_sec = 0
+last_sec_tick = int(time.time())
+UPDATE_INTERVAL = 5  # seconds
+last_update = time.ticks_ms()
+
+# --- Helper functions ---
+def read_chip_temp():
+    sensor = machine.ADC(4)
+    reading = sensor.read_u16()
+    voltage = reading * 3.3 / 65535
+    temp_c = 27 - (voltage - 0.706) / 0.001721
+    return temp_c
+
+def print_stats():
+    global last_update
+    gc.collect()
+    elapsed_ms = time.ticks_diff(time.ticks_ms(), start_time)
+    elapsed_sec = int(elapsed_ms / 1000)
+    hours = elapsed_sec // 3600
+    minutes = (elapsed_sec % 3600) // 60
+    seconds = elapsed_sec % 60
+    avg_clients_per_sec = total_clients / elapsed_sec if elapsed_sec > 0 else 0
+    temp_c = read_chip_temp()
+
+    print("=== Gemini Server Stats ===")
+    print("Total runtime: {:02}h {:02}m {:02}s".format(hours, minutes, seconds))
+    print("Total clients:", total_clients)
+    print("Average clients/sec: {:.3f}".format(avg_clients_per_sec))
+    print("Max clients/sec:", max_clients_per_sec)
+    print("Free memory:", gc.mem_free())
+    print("Chip temperature: {:.2f}°C".format(temp_c))
+    print("===================")
+    last_update = time.ticks_ms()
 
 # --- WiFi ---
 def connect_to_wifi():
@@ -59,19 +97,11 @@ def get_mime_type(filename):
             return mime
     return "application/octet-stream"
 
-# --- Logging ---
-def log_request(client_addr, request, status):
-    t = time.localtime()
-    timestamp = "{:04}-{:02}-{:02} {:02}:{:02}:{:02}".format(
-        t[0], t[1], t[2], t[3], t[4], t[5]
-    )
-    print(f"[{timestamp}] {client_addr} -> {request} ({status})")
-
 # --- Caching ---
 def get_file_content(filepath):
     try:
         st = os.stat(filepath)
-        mtime = st[8]  # modification time
+        mtime = st[8]
     except OSError:
         return None
 
@@ -98,161 +128,126 @@ def safe_join(base, *paths):
         return None
     return full
 
-# --- Read Gemini request safely with reusable buffer ---
-read_buffer = bytearray(READ_BUFFER_SIZE)
+# --- Logging ---
+def log_request(client_addr, request, status):
+    t = time.localtime()
+    timestamp = "{:04}-{:02}-{:02} {:02}:{:02}:{:02}".format(
+        t[0], t[1], t[2], t[3], t[4], t[5]
+    )
+    print(f"[{timestamp}] {client_addr} -> {request} ({status})")
 
-def read_request(tls_client, maxlen=1024):
-    buf = bytearray()
-    while b"\r\n" not in buf and len(buf) < maxlen:
-        try:
-            n = tls_client.readinto(read_buffer)
-            if not n:
-                break
-            buf.extend(read_buffer[:n])
-        except OSError:
-            break
-    return buf.decode().strip()
+# --- Handle client ---
+async def handle_client(reader, writer):
+    global total_clients, clients_this_sec, max_clients_per_sec, last_sec_tick
 
-# --- Send file with reusable buffer ---
-file_buffer = bytearray(FILE_BUFFER_SIZE)
+    addr = writer.get_extra_info('peername')
+    total_clients += 1
+    clients_this_sec += 1
 
-def send_file(tls_client, filepath):
+    # Track max clients/sec
+    current_sec = int(time.time())
+    if current_sec != last_sec_tick:
+        if clients_this_sec > max_clients_per_sec:
+            max_clients_per_sec = clients_this_sec
+        clients_this_sec = 0
+        last_sec_tick = current_sec
+
+    # Read request
     try:
-        with open(filepath, "rb") as f:
-            while True:
-                n = f.readinto(file_buffer)
-                if not n:
-                    break
-                tls_client.write(file_buffer[:n])
+        request = await reader.read(1024)
+        request = request.decode().strip()
+    except Exception as e:
+        print("Read error:", e)
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    # Parse request
+    if request.startswith("gemini://"):
+        path_start = request.find("/", 9)
+        if path_start != -1:
+            request = request[path_start:]
+        else:
+            request = "/"
+    if request == "/":
+        request = "/index.gmi"
+
+    filepath = safe_join(PUBLIC_DIR, request.lstrip("/"))
+    status = ""
+
+    try:
+        st = os.stat(filepath)
+        is_dir = st[0] & 0x4000
+        is_file = st[0] & 0x8000
     except OSError:
-        pass
+        is_dir = is_file = False
 
-# --- Gemini server ---
-def run_gemini_server(cert_path=CERT_PATH, key_path=KEY_PATH):
-    # --- Load SSL context once ---
+    try:
+        if is_dir:
+            if ENABLE_DIR_LISTING:
+                entries = sorted(os.listdir(filepath))
+                lines = []
+                for entry in entries:
+                    ep = request.rstrip("/") + "/" + entry
+                    full_entry = safe_join(filepath, entry)
+                    try:
+                        est = os.stat(full_entry)
+                        if est[0] & 0x4000:
+                            ep += "/"
+                    except OSError:
+                        pass
+                    lines.append(f"=> {ep} {entry}")
+                writer.write(b"20 text/gemini\r\n")
+                writer.write("\n".join(lines).encode())
+                status = "20 Directory Listing"
+            else:
+                writer.write(b"51 Not Found\r\n")
+                status = "51 Not Found"
+        elif is_file:
+            content = get_file_content(filepath)
+            if content:
+                mime_type = get_mime_type(filepath)
+                writer.write(f"20 {mime_type}\r\n".encode())
+                writer.write(content)
+                status = f"20 {mime_type}"
+            else:
+                writer.write(b"51 Not Found\r\n")
+                status = "51 Not Found"
+        else:
+            writer.write(b"51 Not Found\r\n")
+            status = "51 Not Found"
+    except Exception as e:
+        print("File send error:", e)
+
+    log_request(addr[0], request, status)
+
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+# --- Server ---
+async def run_server():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(cert_path, keyfile=key_path)
+    context.load_cert_chain(CERT_PATH, keyfile=KEY_PATH)
 
-    server = socket.socket()
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(5)
-    server.setblocking(False)
+    server = await asyncio.start_server(handle_client, HOST, PORT, ssl=context)
     print(f"Gemini server listening on {HOST}:{PORT}...")
 
-    clients = {}
-    client_addrs = {}
+    # Stats update loop
+    async def stats_loop():
+        global last_update
+        while True:
+            now = time.ticks_ms()
+            if time.ticks_diff(now, last_update) >= UPDATE_INTERVAL * 1000:
+                print_stats()
+            await asyncio.sleep(1)
 
-    while True:
-        gc.collect()  # free memory regularly
-	#print(gc.mem_free())
-
-        # Accept new clients
-        try:
-            client, addr = server.accept()
-            print("New connection from", addr)
-            client.setblocking(False)
-            tls_client = context.wrap_socket(client, server_side=True)
-            clients[client] = tls_client
-            client_addrs[client] = addr[0]
-        except OSError:
-            pass
-
-        # Handle existing clients
-        for client, tls_client in list(clients.items()):
-            try:
-                r, _, _ = select.select([tls_client], [], [], 0)
-                if r:
-                    request = read_request(tls_client)
-                    if not request:
-                        continue
-                    client_ip = client_addrs[client]
-
-                    # Strip gemini://host part if present
-                    if request.startswith("gemini://"):
-                        path_start = request.find("/", 9)
-                        if path_start != -1:
-                            request = request[path_start:]
-                        else:
-                            request = "/"
-
-                    if request == "/":
-                        request = "/index.gmi"
-
-                    filepath = safe_join(PUBLIC_DIR, request.lstrip("/"))
-                    status = ""
-
-                    if not filepath:
-                        tls_client.write(b"59 Bad Request\r\n")
-                        status = "59 Bad Request"
-                    else:
-                        try:
-                            st = os.stat(filepath)
-                            is_dir = st[0] & 0x4000
-                            is_file = st[0] & 0x8000
-                        except OSError:
-                            is_dir = False
-                            is_file = False
-
-                        if is_dir:
-                            if ENABLE_DIR_LISTING:
-                                entries = sorted(os.listdir(filepath))
-                                lines = []
-                                for entry in entries:
-                                    ep = request.rstrip("/") + "/" + entry
-                                    full_entry = safe_join(filepath, entry)
-                                    try:
-                                        est = os.stat(full_entry)
-                                        if est[0] & 0x4000:
-                                            ep += "/"
-                                    except OSError:
-                                        pass
-                                    lines.append(f"=> {ep} {entry}")
-                                tls_client.write(b"20 text/gemini\r\n")
-                                tls_client.write("\n".join(lines).encode())
-                                status = "20 Directory Listing"
-                            else:
-                                tls_client.write(b"51 Not Found\r\n")
-                                status = "51 Not Found"
-
-                        elif is_file:
-                            content = get_file_content(filepath)
-                            if content:
-                                mime_type = get_mime_type(filepath)
-                                tls_client.write(f"20 {mime_type}\r\n".encode())
-                                send_file(tls_client, filepath)
-                                status = f"20 {mime_type}"
-                            else:
-                                tls_client.write(b"51 Not Found\r\n")
-                                status = "51 Not Found"
-
-                        else:
-                            tls_client.write(b"51 Not Found\r\n")
-                            status = "51 Not Found"
-
-                    log_request(client_ip, request, status)
-
-                    # Close client promptly
-                    tls_client.close()
-                    client.close()
-                    del clients[client]
-                    del client_addrs[client]
-
-            except Exception as e:
-                print("Client error:", e)
-                try:
-                    tls_client.close()
-                    client.close()
-                except:
-                    pass
-                if client in clients:
-                    del clients[client]
-                if client in client_addrs:
-                    del client_addrs[client]
+    # Just run stats_loop forever; server is already listening in background
+    await stats_loop()
 
 # --- Main ---
 if __name__ == "__main__":
     wlan = connect_to_wifi()
     if not wlan:
         raise SystemExit
-    run_gemini_server()
+    asyncio.run(run_server())
