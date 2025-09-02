@@ -13,3 +13,22 @@ Takes care of basic TLS handshakes and exposes the contents of the /public direc
 - preventing unwanted directory traversal
 - .gmi → text/gemini, .txt → text/plain.
 - Other files use MIME map or default application/octet-stream.
+- Auto Wi-fi reconnect
+- Graceful shutdown
+- SSD1306 Oled display code included (optional)
+- Secure file transfer & delete server over TLS (for remote file management)
+- Mutual TLS (mTLS) requiring client certificates for any file operation (shared secret)
+- Supports chunked uploads, delete and list commands.
+
+## Caveats
+
+1. The certificate files on the RPico must be in the .der format. I just couldn't get .pem to work. Not sure why. 
+
+2. The key on the pico must be converted to the rsa -traditional format; i.e., the file must start with === BEGIN RSA PRIVATE KEY ===.
+
+3. The key of the client can be in .pem.
+
+
+4. If you get errors about certificate being too weak or similar, make sure your key is 2048+ bit long.
+
+5. The upload "client" is still under development
