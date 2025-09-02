@@ -15,7 +15,7 @@ Takes care of basic TLS handshakes and exposes the contents of the /public direc
 - Other files use MIME map or default application/octet-stream.
 - Auto Wi-fi reconnect
 - Graceful shutdown
-- SSD1306 Oled display code included (optional)
+- SSD1306 Oled display code included (optional; currently hardcoded for pins 16 and 17 for SDA and SDL)
 - Secure file transfer & delete server over TLS (for remote file management)
 - Mutual TLS (mTLS) requiring client certificates for any file operation (shared secret)
 - Supports chunked uploads, delete and list commands.
