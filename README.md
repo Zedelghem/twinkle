@@ -32,3 +32,7 @@ Takes care of basic TLS handshakes and exposes the contents of the /public direc
 4. If you get errors about certificate being too weak or similar, make sure your key is 2048+ bit long.
 
 5. The upload "client" is still under development
+
+## What about Gopher?
+
+There's an excellent Gopher server for Pico already written: https://github.com/aittalam/PicoGopher. I don't see a reason for a rewrite at this point.
